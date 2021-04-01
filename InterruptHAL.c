@@ -41,13 +41,16 @@
  */
 struct _InterruptHAL
 {
-    /*
-     * An event bitfield variable whose bits are to be written a 1 (as
-     * appropriate) whenever a corresponding ISR event occurs. When the main
-     * application reads the event bitfield, we then reset this variable so that
-     * we're ready to log more events from ISRs again.
+    /* Event flags which are written as [true] whenever a corresponding ISR
+     * occurs. When the main application goes to sleep, we must reset all of
+     * these variables so that we're ready to log more events from our ISRs
+     * again.
+     *
+     * TODO: You will most likely need to add more interrupt event flags as you
+     *       expand what ISRs you implement in your system.
      */
-    volatile HAL_Event Event;
+    volatile bool L1Tapped;
+    volatile bool JSTapped;
 };
 typedef struct _InterruptHAL InterruptHAL;
 
@@ -60,13 +63,14 @@ static InterruptHAL s_hal;
 /******************************************************************************/
 /* STATIC FUNCTION HEADERS AND PREPROCESSOR MACROS                            */
 /******************************************************************************/
-#define DEBOUNCE_TIME_MS            (300)
+#define DEBOUNCE_TIME_MS            (50)
 
 /* Interrupt Service Routines ----------------------------------------------- */
-static void ISR_LaunchpadButtons(void);
 /* TODO: You will most likely need to add more interrupt service routines as  */
 /*       you expand what hardware you need to use from the board.             */
 /* -------------------------------------------------------------------------- */
+static void ISR_LaunchpadButtons(void);
+static void ISR_BoosterpackJS(void);
 
 /* Initialization Functions ------------------------------------------------- */
 /* TODO: You will most likely need to add more initialization functions as    */
@@ -96,7 +100,7 @@ static void ISR_LaunchpadButtons(void)
     /* event to be logged even on the first trigger of this ISR.              */
     /* ---------------------------------------------------------------------- */
     static SWTimer debounceL1;
-    static bool firstCall = false;
+    static bool firstCall = true;
 
     if (firstCall)
     {
@@ -112,10 +116,10 @@ static void ISR_LaunchpadButtons(void)
     /* Check if L1 (Port 1, Pin 1) generated this ISR. */
     if ((status & GPIO_PIN1) == GPIO_PIN1)
     {
-        /* Log the event in our event bitmask if the debouncer has expired */
+        /* Log the event using the L1Tapped flag if the debouncer has expired */
         if (SWTimer_expired(&debounceL1))
         {
-            s_hal.Event |= HAL_L1_TAPPED;
+            s_hal.L1Tapped = true;
 
             /* FOR DEMO PURPOSES ONLY - You can remove this. For debugging    */
             /* purposes, you can turn on and off LEDs in ISRs as appropriate. */
@@ -125,10 +129,47 @@ static void ISR_LaunchpadButtons(void)
             /* soon after this call, we ignore it until the timer expires.    */
             SWTimer_start(&debounceL1);
         }
-
-        /* After servicing an interrupt, clear appropriate interrupt flags. */
-        GPIO_clearInterruptFlag(GPIO_PORT_P1, GPIO_PIN1);
     }
+
+    /* After servicing an interrupt, clear appropriate interrupt flags. */
+    GPIO_clearInterruptFlag(GPIO_PORT_P1, GPIO_PIN1);
+}
+
+/**
+ * Automatically invoked by the MSP432's interrupt controller whenever any input
+ * pin on GPIO_PORT4 triggers an interrupt event, namely the Boosterpack
+ * joystick button. Do not call this function manually.
+ */
+static void ISR_BoosterpackJS(void)
+{
+    /* We use the same debouncing technique as before to debounce this ISR. */
+    static SWTimer debounceJS;
+    static bool firstCall = true;
+
+    if (firstCall)
+    {
+        debounceJS = SWTimer_construct(DEBOUNCE_TIME_MS);
+        firstCall = false;
+    }
+
+    uint32_t status = GPIO_getEnabledInterruptStatus(GPIO_PORT_P4);
+
+    /* Check if the joystick button (Port 4, Pin 1) generated this ISR */
+    if ((status & GPIO_PIN1) == GPIO_PIN1)
+    {
+        /* Log the event using the JSTapped flag if the debouncer has expired */
+        if (SWTimer_expired(&debounceJS))
+        {
+            s_hal.JSTapped = true;
+
+            /* Restart this timer so that if the interrupt triggers again too */
+            /* soon after this call, we ignore it until the timer expires.    */
+            SWTimer_start(&debounceJS);
+        }
+    }
+
+    /* After servicing an interrupt, clear appropriate interrupt flags. */
+    GPIO_clearInterruptFlag(GPIO_PORT_P4, GPIO_PIN1);
 }
 
 /**
@@ -139,7 +180,8 @@ static void ISR_LaunchpadButtons(void)
  */
 static void Init_HALVariables()
 {
-    s_hal.Event = HAL_NONE;
+    s_hal.JSTapped = false;
+    s_hal.L1Tapped = false;
 }
 
 /**
@@ -179,6 +221,26 @@ static void Init_LaunchpadButtons(void)
     /* Enables the interrupt for GPIO_PORT1 events. To determine what other
      * events are available for configuration, CTRL+click on INT_PORT1. */
     Interrupt_enableInterrupt(INT_PORT1);
+}
+
+/**
+ * Initializes the Boosterpack JS button with interrupts enabled on a
+ * high-to-low transition, or a falling edge.
+ *
+ * TODO: Add more Boosterpack buttons to this, and tweak or add the ISRs to
+ *       generate events upon pressing these other buttons as well.
+ */
+static void Init_BoosterpackButtons(void)
+{
+    GPIO_setAsInputPin(GPIO_PORT_P4, GPIO_PIN1);
+
+    GPIO_clearInterruptFlag(GPIO_PORT_P4, GPIO_PIN1);
+    GPIO_enableInterrupt(GPIO_PORT_P4, GPIO_PIN1);
+    GPIO_registerInterrupt(GPIO_PORT_P4, ISR_BoosterpackJS);
+    GPIO_interruptEdgeSelect(
+        GPIO_PORT_P4, GPIO_PIN1, GPIO_HIGH_TO_LOW_TRANSITION);
+
+    Interrupt_enableInterrupt(INT_PORT4);
 }
 
 /******************************************************************************/
@@ -224,6 +286,7 @@ void Init_InterruptHal(void)
 
     /* Input peripheral initialization */
     Init_LaunchpadButtons();
+    Init_BoosterpackButtons();
 
     /* Output initialization */
     Init_LaunchpadLEDs();
@@ -232,45 +295,50 @@ void Init_InterruptHal(void)
      * after an ISR is fired. (Depending on the interrupt, in order to wake the
      * processor, you may also need to manually disable the corresponding ISR by
      * calling [Interrupt_disableInterrupt()] with the corresponding interrupt
-     * number.
-     */
+     * number. */
     Interrupt_disableSleepOnIsrExit();
     Interrupt_enableMaster();
 }
 
 /**
- * Retrieves the most recent event(s) generated by a relevant ISR. In order to
- * return multiple events, we bitmask the events in the HAL_Event member of
- * s_hal. This allows us to return multiple values while only using a single
- * return variable.
- *
- * For example, if both L1 and L2 were pressed at the exact same time, the
- * HAL_Event we return will be the bitwise OR as follows:
- *
- *   s_hal.Event == HAL_L1_TAPPED | HAL_L2_TAPPED
- *
- * This means that to check what events have occurred since the last time the
- * processor was put to sleep, you can simply use the individual bitmasks as
- * follows:
- *
- * [code]
- *   HAL_Event event = InterruptHAL_MostRecentEvent()
- *
- *   if (event & HAL_L1_TAPPED)
- *   {
- *       // your code goes here
- *   }
- *
- *   if (event & HAL_L2_TAPPED)
- *   {
- *       // your code goes here
- *   }
- * [/code]
+ * Clears all interrupt event flags, then puts the processor to sleep. Since we
+ * expect an ISR to write to one (or more) interrupt event flags, we need to
+ * clear them here (reset booleans flags, reset state counters, etc.)
  */
-HAL_Event InterruptHAL_MostRecentEvent(void)
+void SleepProcessor(void)
 {
-    HAL_Event event = s_hal.Event;
-    s_hal.Event = HAL_NONE;
+    s_hal.L1Tapped = false;
+    s_hal.JSTapped = false;
 
-    return event;
+    /* After this line, your MSP432 will sleep until an ISR awakens it. */
+    PCM_gotoLPM0();
+}
+
+/******************************************************************************/
+/* EVENT FLAG GETTERS                                                         */
+/* -------------------------------------------------------------------------- */
+/* Basic getters which return a copy of the event flags set by the ISRs. We   */
+/* use these functions in our interrupt dispatcher in the main application to */
+/* determine what interrupts occurred (for example, if any buttons were       */
+/* pressed or if hardware timers have expired). We need these getters so that */
+/* we can at least read the members of s_hal outside of this file (recall     */
+/* that [s_hal] is static and cannot be directly accessed!)                   */
+/******************************************************************************/
+
+/**
+ * Returns whether the left launchpad button was tapped from the last time the
+ * processor was put to sleep.
+ */
+bool LaunchpadS1_Tapped(void)
+{
+    return s_hal.L1Tapped;
+}
+
+/**
+ * Returns whether the joystick button was tapped from the last time the
+ * processor was put to sleep.
+ */
+bool BoosterpackJS_Tapped(void)
+{
+    return s_hal.JSTapped;
 }
