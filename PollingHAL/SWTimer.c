@@ -31,6 +31,9 @@ void ISR_Timer32_0_Rollover()
  */
 void InitSystemTiming()
 {
+    // First, stop the watchdog timer immediately.
+    WDT_A_holdTimer();
+
     // Before initializing anything else, disable all interrupts
     Interrupt_disableMaster();
 
