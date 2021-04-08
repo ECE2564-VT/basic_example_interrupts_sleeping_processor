@@ -121,10 +121,6 @@ static void ISR_LaunchpadButtons(void)
         {
             s_hal.L1Tapped = true;
 
-            /* FOR DEMO PURPOSES ONLY - You can remove this. For debugging    */
-            /* purposes, you can turn on and off LEDs in ISRs as appropriate. */
-            LaunchpadLED2_Toggle();
-
             /* Restart this timer so that if the interrupt triggers again too */
             /* soon after this call, we ignore it until the timer expires.    */
             SWTimer_start(&debounceL1);
